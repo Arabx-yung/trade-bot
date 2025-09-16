@@ -1,5 +1,4 @@
-
-Here you go and don't forget the /delete inline buttons. #!/usr/bin/env python3 
+#!/usr/bin/env python3 
 """
 Final full bot.py
 Features:
@@ -867,3 +866,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
