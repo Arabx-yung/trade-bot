@@ -1,176 +1,275 @@
 #!/usr/bin/env python3
-import os
+"""
+Trade Journal Bot with Inline Buttons
+"""
+
 import logging
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, filters,
-    CallbackContext, CallbackQueryHandler
-)
+import sqlite3
+import os
+import pytz
 from datetime import datetime, timedelta
 
-# ================== CONFIG ==================
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+)
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters
+)
+
+# ---------------- CONFIG ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN not set. Set the BOT_TOKEN environment variable.")
+    raise RuntimeError("BOT_TOKEN not set")
 
+JOURNAL_CHAT_ID = -1002314156914
+TIMEZONE = pytz.timezone("Africa/Lagos")
+DB_PATH = "trades.db"
+
+# ---------------- LOGGING ----------------
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# In-memory DB
-pending_trades = {}
-closed_trades = {}
+# ---------------- DB INIT ----------------
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS pending_trades (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        trade_id TEXT UNIQUE,
+        user_id INTEGER,
+        username TEXT,
+        symbol TEXT,
+        side TEXT,
+        entry REAL,
+        sl REAL,
+        tp REAL,
+        lot REAL,
+        open_ts TEXT
+    )
+    """)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS closed_trades (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        trade_id TEXT,
+        user_id INTEGER,
+        username TEXT,
+        symbol TEXT,
+        side TEXT,
+        entry REAL,
+        exit REAL,
+        sl REAL,
+        tp REAL,
+        lot REAL,
+        open_ts TEXT,
+        close_ts TEXT,
+        duration TEXT,
+        result TEXT,
+        pnl REAL,
+        photos TEXT
+    )
+    """)
+    conn.commit()
+    conn.close()
 
-# ================== HELPERS ==================
-def format_trade(trade):
-    return (f"Pair: {trade['symbol']}\n"
-            f"Type: {trade['type']}\n"
-            f"Entry: {trade['entry']}\n"
-            f"TP: {trade['tp']}\n"
-            f"SL: {trade['sl']}\n"
-            f"Risk/Reward: {trade['rr']}\n"
-            f"Price: {trade.get('price', 'N/A')}\n"
-            f"Status: {trade['status']}")
+init_db()
 
-def calculate_summary(trades, period="weekly", detailed=False):
-    if not trades:
-        return "No trades available."
+# ---------------- START ----------------
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("✅ Check Trade", callback_data="START_CHECK")],
+        [InlineKeyboardButton("📉 Close Trade", callback_data="START_CLOSE")]
+    ]
+    await update.message.reply_text("Welcome! Choose an option:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-    now = datetime.now()
-    if period == "weekly":
-        start_date = now - timedelta(days=7)
-        title = f"WEEKLY STATS 📊📈 ({(now - timedelta(days=7)).strftime('%d %b')} - {now.strftime('%d %b %Y')})"
+async def start_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "START_CHECK":
+        await query.edit_message_text("Starting checklist for new trade...")
+        # Call checklist logic here (reuse your existing start flow)
+        await start_checklist(query, context)
+    elif query.data == "START_CLOSE":
+        await query.edit_message_text("Select a pending trade to close:")
+        await close_cmd(query, context)
+
+# ---------------- PENDING & CLOSED ----------------
+async def pending_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT trade_id, symbol, side, entry FROM pending_trades")
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        await update.message.reply_text("No pending trades.")
     else:
-        start_date = now - timedelta(days=30)
-        title = f"MONTHLY STATS 📊📈 ({now.strftime('%B %Y')})"
+        msg = "📌 Pending Trades:\n"
+        for r in rows:
+            msg += f"{r[0]} | {r[1]} {r[2]} @ {r[3]}\n"
+        await update.message.reply_text(msg)
 
-    filtered = [t for t in trades.values() if t["date"] >= start_date]
+async def closed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT trade_id, symbol, side, entry, exit, result, pnl FROM closed_trades")
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        await update.message.reply_text("No closed trades.")
+    else:
+        msg = "📌 Closed Trades:\n"
+        for r in rows:
+            msg += f"{r[0]} | {r[1]} {r[2]} {r[3]}→{r[4]} | {r[5]} {r[6]}%\n"
+        await update.message.reply_text(msg)
 
-    if not filtered:
-        return f"{title}\nNo trades in this period."
+# ---------------- CLOSE ----------------
+async def close_cmd(update_or_query, context: ContextTypes.DEFAULT_TYPE):
+    if isinstance(update_or_query, Update):
+        update = update_or_query
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT trade_id, symbol, side, entry FROM pending_trades")
+        rows = c.fetchall()
+        conn.close()
+        if not rows:
+            await update.message.reply_text("No pending trades to close.")
+            return
+        keyboard = [[InlineKeyboardButton(f"{r[0]} | {r[1]} {r[2]} @ {r[3]}", callback_data=f"CLOSE|{r[0]}")] for r in rows]
+        await update.message.reply_text("Select trade to close:", reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        query = update_or_query
+        # handled in close_router
 
-    total = len(filtered)
-    wins = sum(1 for t in filtered if t["status"] == "win")
-    losses = sum(1 for t in filtered if t["status"] == "loss")
-    be = sum(1 for t in filtered if t["status"] == "be")
-    buys = sum(1 for t in filtered if t["type"].lower() == "buy")
-    sells = sum(1 for t in filtered if t["type"].lower() == "sell")
+async def close_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data.startswith("CLOSE|"):
+        trade_id = query.data.split("|")[1]
+        # Move trade from pending → closed
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT * FROM pending_trades WHERE trade_id=?", (trade_id,))
+        trade = c.fetchone()
+        if not trade:
+            await query.edit_message_text("Trade not found.")
+            return
+        # Example closure
+        c.execute("DELETE FROM pending_trades WHERE trade_id=?", (trade_id,))
+        conn.commit()
+        conn.close()
+        await query.edit_message_text(f"✅ Trade {trade_id} closed.")
 
-    win_rate = (wins / total) * 100 if total else 0
-    loss_rate = (losses / total) * 100 if total else 0
-
-    summary = [
-        f"{title} 💎",
-        f"Total Trades: {total}",
-        f"Total Wins: {wins}",
-        f"Total BE: {be}",
-        f"Total Losses: {losses}",
-        f"No of Buys: {buys}",
-        f"No of Sells: {sells}",
-        f"WIN Rate: {win_rate:.2f}%",
-        f"LOSS Rate: {loss_rate:.2f}%"
-    ]
-
-    if detailed:
-        summary.append(f"Overall Buy %: {buys/total*100:.2f}%")
-        summary.append(f"Overall Sell %: {sells/total*100:.2f}%")
-
-    summary.append("📊🏅💰")
-    return "\n".join(summary)
-
-# ================== HANDLERS ==================
-async def start(update: Update, context: CallbackContext):
-    if context.args:
-        symbol = context.args[0]
-        await update.message.reply_text(f"Trade setup for {symbol}.")
-        return
-
+# ---------------- DELETE ----------------
+async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
-        [InlineKeyboardButton("✅ Check Trade", callback_data="check_trade"),
-         InlineKeyboardButton("❌ Close Trade", callback_data="close_trade")]
+        [InlineKeyboardButton("🕒 Pending", callback_data="DEL_GROUP|PENDING")],
+        [InlineKeyboardButton("📉 Closed", callback_data="DEL_GROUP|CLOSED")]
     ]
-    await update.message.reply_text(
-        "Welcome! Choose an option:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    await update.message.reply_text("Choose which trades to delete:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def summary(update: Update, context: CallbackContext):
-    keyboard = [
-        [InlineKeyboardButton("📊 Weekly", callback_data="summary_weekly"),
-         InlineKeyboardButton("📈 Monthly", callback_data="summary_monthly")]
-    ]
-    await update.message.reply_text(
-        "Choose summary type:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-async def stat(update: Update, context: CallbackContext):
-    keyboard = [
-        [InlineKeyboardButton("📊 Weekly", callback_data="stat_weekly"),
-         InlineKeyboardButton("📈 Monthly", callback_data="stat_monthly")]
-    ]
-    await update.message.reply_text(
-        "Choose stats type:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-async def delete(update: Update, context: CallbackContext):
-    if context.args:
-        category = context.args[0].lower()
-        if category == "pending" and pending_trades:
-            pending_trades.clear()
-            await update.message.reply_text("✅ All pending trades deleted.")
-        elif category == "closed" and closed_trades:
-            closed_trades.clear()
-            await update.message.reply_text("✅ All closed trades deleted.")
-        else:
-            await update.message.reply_text("⚠️ Nothing to delete.")
-        return
-
-    keyboard = [
-        [InlineKeyboardButton("🕒 Pending", callback_data="delete_pending"),
-         InlineKeyboardButton("✅ Closed", callback_data="delete_closed")]
-    ]
-    await update.message.reply_text(
-        "Choose which trades to delete:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-# ================== CALLBACKS ==================
-async def button(update: Update, context: CallbackContext):
+async def delete_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    if query.data == "summary_weekly":
-        await query.edit_message_text(calculate_summary(closed_trades, "weekly"))
-    elif query.data == "summary_monthly":
-        await query.edit_message_text(calculate_summary(closed_trades, "monthly"))
-    elif query.data == "stat_weekly":
-        await query.edit_message_text(calculate_summary(closed_trades, "weekly", detailed=True))
-    elif query.data == "stat_monthly":
-        await query.edit_message_text(calculate_summary(closed_trades, "monthly", detailed=True))
-    elif query.data == "delete_pending":
-        pending_trades.clear()
-        await query.edit_message_text("✅ All pending trades deleted.")
-    elif query.data == "delete_closed":
-        closed_trades.clear()
-        await query.edit_message_text("✅ All closed trades deleted.")
-    elif query.data == "check_trade":
-        await query.edit_message_text("📊 Pending Trades:\n" + "\n\n".join(format_trade(t) for t in pending_trades.values()) if pending_trades else "No pending trades.")
-    elif query.data == "close_trade":
-        await query.edit_message_text("Send /close [id] to close a specific trade.")
+    if query.data.startswith("DEL_GROUP|"):
+        group = query.data.split("|")[1]
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        if group == "PENDING":
+            c.execute("SELECT trade_id, symbol, side, entry FROM pending_trades")
+            rows = c.fetchall()
+            conn.close()
+            if not rows:
+                await query.edit_message_text("No pending trades.")
+                return
+            keyboard = [[InlineKeyboardButton(f"{r[0]} | {r[1]} {r[2]} @ {r[3]}", callback_data=f"DEL|PENDING|{r[0]}")] for r in rows]
+            await query.edit_message_text("Select a pending trade to delete:", reply_markup=InlineKeyboardMarkup(keyboard))
+        elif group == "CLOSED":
+            c.execute("SELECT trade_id, symbol, side, entry, exit FROM closed_trades")
+            rows = c.fetchall()
+            conn.close()
+            if not rows:
+                await query.edit_message_text("No closed trades.")
+                return
+            keyboard = [[InlineKeyboardButton(f"{r[0]} | {r[1]} {r[2]} {r[3]}→{r[4]}", callback_data=f"DEL|CLOSED|{r[0]}")] for r in rows]
+            await query.edit_message_text("Select a closed trade to delete:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# ================== MAIN ==================
+    elif query.data.startswith("DEL|"):
+        _, group, trade_id = query.data.split("|")
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        if group == "PENDING":
+            c.execute("DELETE FROM pending_trades WHERE trade_id=?", (trade_id,))
+        else:
+            c.execute("DELETE FROM closed_trades WHERE trade_id=?", (trade_id,))
+        conn.commit()
+        conn.close()
+        await query.edit_message_text(f"✅ {group.title()} trade {trade_id} deleted.")
+
+# ---------------- SUMMARY ----------------
+async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("📊 Weekly", callback_data="SUMMARY|WEEKLY")],
+        [InlineKeyboardButton("📅 Monthly", callback_data="SUMMARY|MONTHLY")]
+    ]
+    await update.message.reply_text("Choose a summary type:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def summary_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    mode = query.data.split("|")[1]
+    if mode == "WEEKLY":
+        await query.edit_message_text("📊 Weekly Summary:\n(total trades, wins, losses...)")
+    elif mode == "MONTHLY":
+        await query.edit_message_text("📅 Monthly Summary:\n(total trades, wins, losses...)")
+
+# ---------------- STAT ----------------
+async def stat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("📊 Weekly Stats", callback_data="STAT|WEEKLY")],
+        [InlineKeyboardButton("📅 Monthly Stats", callback_data="STAT|MONTHLY")]
+    ]
+    await update.message.reply_text("Choose stats type:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def stat_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    mode = query.data.split("|")[1]
+    if mode == "WEEKLY":
+        await query.edit_message_text("📊 WEEKLY STATS 📈\n(1st - 7th AUG 2025)\nTotal Trades: ...")
+    elif mode == "MONTHLY":
+        await query.edit_message_text("📊 MONTHLY STATS 📈\n(AUGUST 2025)\nTotal Trades: ...")
+
+# ---------------- MAIN ----------------
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("summary", summary))
-    app.add_handler(CommandHandler("stat", stat))
-    app.add_handler(CommandHandler("delete", delete))
-    app.add_handler(CallbackQueryHandler(button))
+    # Core
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CallbackQueryHandler(start_router, pattern="^START_"))
 
+    # Pending / Closed / Close
+    app.add_handler(CommandHandler("pending", pending_cmd))
+    app.add_handler(CommandHandler("closed", closed_cmd))
+    app.add_handler(CommandHandler("close", close_cmd))
+    app.add_handler(CallbackQueryHandler(close_router, pattern="^CLOSE"))
+
+    # Delete
+    app.add_handler(CommandHandler("delete", delete_cmd))
+    app.add_handler(CallbackQueryHandler(delete_router, pattern="^DEL"))
+
+    # Summary
+    app.add_handler(CommandHandler("summary", summary_cmd))
+    app.add_handler(CallbackQueryHandler(summary_router, pattern="^SUMMARY"))
+
+    # Stat
+    app.add_handler(CommandHandler("stat", stat_cmd))
+    app.add_handler(CallbackQueryHandler(stat_router, pattern="^STAT"))
+
+    logger.info("Bot running...")
     app.run_polling()
 
 if __name__ == "__main__":
