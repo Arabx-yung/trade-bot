@@ -16,6 +16,9 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters
 )
+from telegram.ext import (
+    MessageHandler, filters
+)
 
 # ---------------- CONFIG ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -79,22 +82,49 @@ init_db()
 
 # ---------------- START ----------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if args:  # e.g. /start GBPAUD
+        symbol = args[0].upper()
+        return await start_checklist(update, context, symbol)
+
+    # Default inline button menu
     keyboard = [
         [InlineKeyboardButton("✅ Check Trade", callback_data="START_CHECK")],
         [InlineKeyboardButton("📉 Close Trade", callback_data="START_CLOSE")]
     ]
     await update.message.reply_text("Welcome! Choose an option:", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+async def start_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "START_CHECK":
+        await query.message.reply_text("Please enter the trade symbol (e.g., EURUSD):")
+        context.user_data["awaiting_symbol"] = True
+        return
+    elif query.data == "START_CLOSE":
+        # Call your close handler logic
+        return await close_cmd(update, context)
 
 async def start_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if query.data == "START_CHECK":
-        await query.edit_message_text("Starting checklist for new trade...")
-        # Call checklist logic here (reuse your existing start flow)
-        await start_checklist(query, context)
+        await start_checklist(query, context, symbol="")  # user will still need to type /start SYMBOL if missing
     elif query.data == "START_CLOSE":
         await query.edit_message_text("Select a pending trade to close:")
         await close_cmd(query, context)
+        
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text.strip().upper()
+
+    # Check if the bot is waiting for a symbol
+    if context.user_data.get("awaiting_symbol"):
+        context.user_data["awaiting_symbol"] = False
+        return await start_checklist(update, context, user_text)
+
+    # Otherwise, ignore or guide user
+    await update.message.reply_text("I didn’t understand. Use /start to see options.")
 
 # ---------------- PENDING & CLOSED ----------------
 async def pending_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -249,7 +279,9 @@ def main():
 
     # Core
     app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CallbackQueryHandler(start_menu_handler, pattern="^START_"))
     app.add_handler(CallbackQueryHandler(start_router, pattern="^START_"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     # Pending / Closed / Close
     app.add_handler(CommandHandler("pending", pending_cmd))
@@ -274,3 +306,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
