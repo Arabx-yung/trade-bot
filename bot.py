@@ -1,19 +1,25 @@
-#!/usr/bin/env python3
+
+Here you go and don't forget the /delete inline buttons. #!/usr/bin/env python3 
 """
-Full bot.py — trade journal + summary/delete/stat (inline menus) + risk calc + econ calendar
+Final full bot.py
+Features:
+- /start SYMBOL -> BUY/SELL -> checklist -> TAKE -> entry/lot/sl/tp -> save pending
+- /pending -> list pending trades (detailed)
+- /close [SYMBOL] -> only closes pending trades (or /close with no args -> pick via buttons)
+- Closing flow: exit, lot (default from pending), open datetime (SAME allowed), close datetime, reason, result, pnl, photos (1-10), DONE to finalize
+- Posts journal to JOURNAL_CHAT_ID (first photo captioned)
+- Moves trade from pending_trades -> closed_trades
+- /closed -> list recent closed trades
+- /summary [week|month|all] -> stats
+- /delete pending, /delete closed -> select & delete trades
 """
 
 import logging
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
 import ast
 import re
-import os
-import math
-import json
-
-import requests  # used only by calendar if TE_API_KEY provided
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
@@ -26,17 +32,18 @@ from telegram.ext import (
 # -----------------------
 # CONFIG
 # -----------------------
+import os
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN not set. Set the BOT_TOKEN environment variable.")
 
-JOURNAL_CHAT_ID = int(os.getenv("JOURNAL_CHAT_ID", "-1002314156914"))
-TIMEZONE = pytz.timezone(os.getenv("TZ", "Africa/Lagos"))
-DB_PATH = os.getenv("DB_PATH", "trades.db")
-DATEFMT = "%Y-%m-%d %H:%M"
+print("BOT_TOKEN is:", BOT_TOKEN)
 
-# optional TradingEconomics API key (or any other calendar API you prefer)
-TE_API_KEY = os.getenv("TE_API_KEY", "").strip()
+JOURNAL_CHAT_ID = -1002314156914
+TIMEZONE = pytz.timezone("Africa/Lagos")
+DB_PATH = "trades.db"
+DATEFMT = "%Y-%m-%d %H:%M"
 
 # -----------------------
 # Logging
@@ -147,8 +154,13 @@ def pretty_breakdown(breakdown: dict) -> str:
     return "\n".join([f"- {k}: +{v}" for k, v in breakdown.items()])
 
 def parse_datetime(s: str):
+    """
+    Parse a datetime string using DATEFMT, assume TIMEZONE.
+    Returns a timezone-aware datetime.
+    """
     try:
         dt = datetime.strptime(s.strip(), DATEFMT)
+        # treat as timezone-local
         return TIMEZONE.localize(dt)
     except Exception:
         return None
@@ -166,26 +178,6 @@ def pretty_duration(open_ts: datetime, close_ts: datetime) -> str:
     if mins:
         parts.append(f"{mins}m")
     return " ".join(parts) if parts else "0m"
-
-# ---------- PnL parsing utility ----------
-def parse_pnl_value(s):
-    """Try to parse pnl to a float. Accept '12.3', '-4.5', '1.2%', '-0.5%'. Return (value, is_percent)."""
-    if s is None:
-        return None, False
-    s = str(s).strip()
-    if s == "":
-        return None, False
-    try:
-        if s.endswith("%"):
-            return float(s.strip("%")), True
-        return float(s), False
-    except Exception:
-        # try to remove commas, other chars
-        s2 = re.sub(r"[^\d\.\-]", "", s)
-        try:
-            return float(s2), False
-        except Exception:
-            return None, False
 
 # -----------------------
 # Keyboards
@@ -208,6 +200,7 @@ def checklist_kb(selected: dict):
         mark = "✅" if selected.get(key) else "⬜️"
         return InlineKeyboardButton(f"{mark} {label}", callback_data=f"TOGGLE|{key}")
     rows = []
+    # create compact rows of 3 where possible
     keys = [k for k,_,_ in CHECKLIST_ITEMS]
     for i in range(0, len(keys), 3):
         rows.append([make_btn(k) for k in keys[i:i+3]])
@@ -221,28 +214,11 @@ def take_kb():
          InlineKeyboardButton("❌ Skip trade", callback_data="TAKE|NO")]
     ])
 
-def summary_choice_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📅 Weekly", callback_data="SUMMARY|WEEK"),
-         InlineKeyboardButton("📆 Monthly", callback_data="SUMMARY|MONTH")]
-    ])
-
-def stat_choice_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📅 Weekly", callback_data="STAT|WEEK"),
-         InlineKeyboardButton("📆 Monthly", callback_data="STAT|MONTH")]
-    ])
-
-def delete_choice_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📂 Pending", callback_data="DELETE|PENDING"),
-         InlineKeyboardButton("📁 Closed", callback_data="DELETE|CLOSED")]
-    ])
-
 # -----------------------
 # Commands
 # -----------------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # /start SYMBOL (shortcut)
     args = context.args
     if not args:
         await update.message.reply_text("Usage: /start EURUSD  — or send /start EURUSD to begin.")
@@ -286,8 +262,10 @@ async def closed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # /close [SYMBOL] or /close -> show pending list
     args = context.args
     if not args:
+        # show inline buttons for pending trades
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute("SELECT id, trade_id, symbol, side, entry FROM pending_trades ORDER BY id DESC")
@@ -303,6 +281,8 @@ async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             buttons.append([InlineKeyboardButton(label, callback_data=f"CLOSE_SEL|{tid}")])
         await update.message.reply_text("Select a pending trade to close:", reply_markup=InlineKeyboardMarkup(buttons))
         return
+
+    # if symbol provided, only proceed if pending exists for symbol (latest)
     symbol = args[0].upper()
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -312,106 +292,18 @@ async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not row:
         await update.message.reply_text(f"❌ No pending trade found for {symbol}. Use /pending to see active trades.")
         return
+    # load pending trade and start close flow
     await _start_close_from_row(row, update, context)
 
-# Summary command now shows inline choices if no args
 async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Choose summary period:", reply_markup=summary_choice_kb())
-        return
-    # fallback to old behaviour (arg provided)
+    # /summary [week|month|all]
     period = "all"
-    arg = context.args[0].lower()
-    if arg in ("week", "w"):
-        period = "week"
-    elif arg in ("month", "m"):
-        period = "month"
-    await _compute_and_send_summary(update, context, period)
-
-# New /stat command - detailed performance
-async def stat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # show inline weekly/monthly selector
-    await update.message.reply_text("Choose stats period:", reply_markup=stat_choice_kb())
-
-# Delete command now shows inline choices if no args
-async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Delete from:", reply_markup=delete_choice_kb())
-        return
-    # keep previous behavior if arg is provided
-    target = context.args[0].lower()
-    await _handle_delete_with_arg(update, context, target)
-
-# Risk calculator command
-# Usage: /risk 1000 2 30 EURUSD  -> balance risk% sl_pips [pair optional]
-# Interactive mode: user sends /risk and bot will ask
-async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args:
-        # interactive quick mode
-        context.user_data.clear()
-        context.user_data["mode"] = "risk_ask_balance"
-        await update.message.reply_text("Enter account balance (e.g. 1000):")
-        return
-    # parse quick form
-    try:
-        bal = float(args[0])
-        risk_pct = float(args[1])
-        sl_pips = float(args[2])
-        pair = args[3].upper() if len(args) > 3 else None
-    except Exception:
-        await update.message.reply_text("Usage: /risk <balance> <risk_percent> <stoploss_pips> [PAIR]\nExample: /risk 1000 1 30 EURUSD")
-        return
-    lot, risk_amount, note = compute_lot_size(bal, risk_pct, sl_pips, pair)
-    await update.message.reply_text(f"Risk Amount: {risk_amount:.2f}\nSuggested Lot: {lot:.4f}\n{note}")
-
-# Economic calendar: /calendar [today|week]
-async def calendar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    period = "today"
-    if args:
-        period = args[0].lower()
-    if TE_API_KEY:
-        # fetch via TradingEconomics (example). This block tries to fetch meaningful events.
-        try:
-            events = fetch_econ_calendar(period)
-            if not events:
-                await update.message.reply_text("No events returned or none found for this period.")
-                return
-            text = format_calendar_events(events, period)
-            # if long, split messages
-            for chunk in split_message(text, 4000):
-                await update.message.reply_text(chunk)
-            return
-        except Exception as e:
-            logger.exception("Calendar fetch failed: %s", e)
-            await update.message.reply_text("Failed to fetch calendar from API; see server logs.")
-            return
-    # fallback - no API key configured
-    await update.message.reply_text(
-        "Economic calendar requires an API key to fetch live events.\n"
-        "Set TE_API_KEY environment variable or use an external calendar.\n\n"
-        "Quick usage:\n"
-        "/calendar today\n"
-        "/calendar week\n\n"
-        "Alternatively check ForexFactory/Investing.com for live events."
-    )
-
-# -----------------------
-# Internal helpers for summary/stat/delete/risk/calendar
-# -----------------------
-
-def split_message(text, limit=4000):
-    parts = []
-    while text:
-        parts.append(text[:limit])
-        text = text[limit:]
-    return parts
-
-async def _compute_and_send_summary(update: Update, context: ContextTypes.DEFAULT_TYPE, period: str):
-    """
-    period: 'week', 'month', or 'all'
-    """
+    if context.args:
+        arg = context.args[0].lower()
+        if arg in ("week", "w"):
+            period = "week"
+        elif arg in ("month", "m"):
+            period = "month"
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT result, pnl, score, close_ts FROM closed_trades")
@@ -442,11 +334,10 @@ async def _compute_and_send_summary(update: Update, context: ContextTypes.DEFAUL
     avg_score = sum(float(r[2]) for r in filtered if r[2] is not None) / total
     pnl_total = 0.0
     for r in filtered:
-        pval, is_pct = parse_pnl_value(r[1])
-        if pval is None:
-            continue
-        # if percent, add as percent; if absolute, just add absolute
-        pnl_total += pval
+        try:
+            pnl_total += float(str(r[1]).replace(",", "").strip())
+        except Exception:
+            pass
     text = (
         f"📊 Summary ({period.capitalize()})\n\n"
         f"Total trades: {total}\n"
@@ -454,129 +345,94 @@ async def _compute_and_send_summary(update: Update, context: ContextTypes.DEFAUL
         f"❌ Losses: {losses}\n"
         f"⚖️ Break-evens: {bes}\n\n"
         f"📊 Avg Score: {avg_score:.1f}/{MAX_SCORE}\n"
-        f"💰 Total PnL (sum of recorded PnL entries): {pnl_total:.2f}\n"
+        f"💰 Total PnL: {pnl_total:.2f}"
     )
     await update.message.reply_text(text)
 
-async def _handle_delete_with_arg(update: Update, context: ContextTypes.DEFAULT_TYPE, target: str):
+# -----------------------
+# Delete command
+# -----------------------
+async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /delete pending OR /delete closed")
+        return
+
+    target = args[0].lower()
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+
     if target == "pending":
         c.execute("SELECT trade_id, symbol, side, entry FROM pending_trades ORDER BY id DESC")
         rows = c.fetchall()
-        conn.close()
         if not rows:
             await update.message.reply_text("No pending trades to delete.")
+            conn.close()
             return
-        buttons = [[InlineKeyboardButton(f"{sym} {side} @{entry}", callback_data=f"DEL_PENDING|{tid}")] for tid, sym, side, entry in rows]
+        buttons = [
+            [InlineKeyboardButton(f"{sym} {side} @{entry}", callback_data=f"DEL_PENDING|{tid}")]
+            for tid, sym, side, entry in rows
+        ]
         await update.message.reply_text("Select a pending trade to delete:", reply_markup=InlineKeyboardMarkup(buttons))
-        return
+
     elif target == "closed":
         c.execute("SELECT trade_id, symbol, side, entry, exit FROM closed_trades ORDER BY id DESC LIMIT 50")
         rows = c.fetchall()
-        conn.close()
         if not rows:
             await update.message.reply_text("No closed trades to delete.")
+            conn.close()
             return
-        buttons = [[InlineKeyboardButton(f"{sym} {side} Entry:{entry} Exit:{exit_p}", callback_data=f"DEL_CLOSED|{tid}")] for tid, sym, side, entry, exit_p in rows]
+        buttons = [
+            [InlineKeyboardButton(f"{sym} {side} Entry:{entry} Exit:{exit_p}", callback_data=f"DEL_CLOSED|{tid}")]
+            for tid, sym, side, entry, exit_p in rows
+        ]
         await update.message.reply_text("Select a closed trade to delete:", reply_markup=InlineKeyboardMarkup(buttons))
-        return
     else:
-        conn.close()
         await update.message.reply_text("Use /delete pending OR /delete closed")
 
-# -----------------------
-# Risk calc helper (simple, clear) 
-# -----------------------
-def compute_lot_size(balance, risk_pct, sl_pips, pair=None):
-    """
-    Very simple method:
-    - Risk amount = balance * risk_pct / 100
-    - Pip value assumption:
-      - If pair ends with USD (e.g. EURUSD), pip value per standard lot ~ $10.
-      - If pair starts with USD (USDJPY), pip value differs (we ignore complexity).
-      - This function returns approximate lot size.
-    Returns (lot, risk_amount, note)
-    """
-    risk_amount = (balance * (risk_pct / 100.0))
-    # default pip value per standard lot in quote currency
-    pip_value_per_std = 10.0
-    note = "Assumes USD account and quote currency USD (approx)."
-    if pair:
-        p = pair.upper()
-        # common case: EURUSD, GBPUSD, AUDUSD — USD is quote => pip value ~ 10 USD per 1 standard lot
-        if p.endswith("USD"):
-            pip_value_per_std = 10.0
-            note = "Calculated using pip ≈ $10 per standard lot (USD quoted pair)."
-        elif p.startswith("USD"):
-            # USDJPY-like: pip is 0.01 -> pip value approximates 9.12 for 1 lot depending on rate.
-            pip_value_per_std = 9.0
-            note = "USD is base (e.g. USDJPY). Pip value approximated."
-        else:
-            # cross pairs: use approx $10 and warn user
-            pip_value_per_std = 10.0
-            note = "Cross pair: approximate pip value used; for exact, use pair-specific conversion."
-    # lot size formula: lot = risk_amount / (sl_pips * pip_value_per_std)
-    denom = sl_pips * pip_value_per_std
-    if denom == 0:
-        return 0.0, risk_amount, "Invalid SL pips."
-    lot = risk_amount / denom
-    return lot, risk_amount, note
+    conn.close()
 
 # -----------------------
-# Calendar helpers (basic)
+# Internal helpers for closing flow
 # -----------------------
-def fetch_econ_calendar(period="today"):
+async def _start_close_from_row(row, update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Example using TradingEconomics API pattern. If TE_API_KEY is supplied,
-    this will attempt to fetch events. If you use another provider, change this function.
+    Load pending trade DB row into user_data and start closing prompts.
+    row: the pending_trades row
     """
-    if not TE_API_KEY:
-        return []
-    # simple TradingEconomics example - you must check their API docs and adjust parameters
-    # here we attempt to fetch events for the next 7 days for the calendar
-    base = "https://api.tradingeconomics.com/calendar"
-    params = {"c": TE_API_KEY}
-    if period == "today":
-        params["start_date"] = datetime.now().strftime("%Y-%m-%d")
-        params["end_date"] = datetime.now().strftime("%Y-%m-%d")
-    else:
-        params["start_date"] = datetime.now().strftime("%Y-%m-%d")
-        params["end_date"] = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
-    resp = requests.get(base, params=params, timeout=15)
-    if resp.status_code != 200:
-        logger.warning("Calendar API returned %s: %s", resp.status_code, resp.text)
-        return []
-    data = resp.json()
-    # return list of event dicts
-    return data
-
-def format_calendar_events(events, period):
-    # events from various APIs may vary; we'll try to format common fields
-    lines = [f"📅 Economic Calendar — {period.capitalize()}\n"]
-    for e in events[:50]:
-        # attempt robust extraction
-        date = e.get("date") or e.get("date_time") or e.get("time") or e.get("EventDate")
-        country = e.get("country") or e.get("countryCode") or e.get("country_name") or e.get("Country")
-        impact = e.get("impact") or e.get("importance") or e.get("category") or e.get("Impact")
-        title = e.get("event") or e.get("title") or e.get("indicator") or e.get("event_name")
-        lines.append(f"- {date} | {country} | {impact} | {title}")
-    return "\n".join(lines)
+    # row columns: id(0), user_id(1), username(2), trade_id(3), symbol(4), side(5), entry(6), sl(7), tp(8), lot(9), open_ts(10), score(11), score_breakdown(12)
+    context.user_data.clear()
+    context.user_data["pending_row"] = row
+    context.user_data["trade_id_pending"] = row[3]
+    context.user_data["symbol"] = row[4]
+    context.user_data["side"] = row[5]
+    context.user_data["entry_pending"] = row[6]
+    context.user_data["sl_pending"] = row[7]
+    context.user_data["tp_pending"] = row[8]
+    context.user_data["lot_pending"] = row[9]
+    context.user_data["open_ts_pending"] = row[10]  # stored as ISO or str
+    context.user_data["score_pending"] = row[11]
+    context.user_data["score_breakdown_pending"] = row[12]
+    context.user_data["mode"] = "closing_exit"
+    # prompt
+    await (update.callback_query.message.reply_text if update.callback_query else update.message.reply_text)(
+        f"Closing trade {context.user_data['symbol']} {context.user_data['side']} (Entry: {context.user_data['entry_pending']}).\nEnter EXIT price:"
+    )
 
 # -----------------------
-# Callback router
+# Callback router (buttons)
 # -----------------------
 async def callback_query_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data or ""
 
-    # existing menu handlers
     if data == "START|CHECK":
         context.user_data.clear()
         context.user_data["mode"] = "checking_pair"
         await query.edit_message_text("Enter the trading pair to check (e.g. EURUSD):")
         return
+
     if data == "START|CLOSE":
         context.user_data.clear()
         context.user_data["mode"] = "closing_pair"
@@ -584,6 +440,7 @@ async def callback_query_router(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if data.startswith("CHECK|DIR|"):
+        # Example: CHECK|DIR|BUY
         _, _, side = data.split("|")
         context.user_data["side"] = side
         context.user_data["checklist"] = {}
@@ -608,12 +465,14 @@ async def callback_query_router(update: Update, context: ContextTypes.DEFAULT_TY
         score, breakdown = calc_score(selected)
         context.user_data["score"] = score
         context.user_data["score_breakdown"] = breakdown
+        # ask whether to take trade
         await query.edit_message_text(f"Checklist complete — Score: {score}/{MAX_SCORE}", reply_markup=take_kb())
         return
 
     if data.startswith("TAKE|"):
         ag = data.split("|",1)[1]
         if ag == "YES":
+            # ask opening details to save pending: entry/lot/sl/tp then save pending
             context.user_data["mode"] = "await_entry_open"
             await query.edit_message_text("Enter ENTRY price (number):")
         else:
@@ -623,6 +482,7 @@ async def callback_query_router(update: Update, context: ContextTypes.DEFAULT_TY
 
     if data.startswith("CLOSE_SEL|"):
         tid = data.split("|",1)[1]
+        # fetch pending trade by trade_id
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute("SELECT * FROM pending_trades WHERE trade_id=? LIMIT 1", (tid,))
@@ -634,37 +494,9 @@ async def callback_query_router(update: Update, context: ContextTypes.DEFAULT_TY
         await _start_close_from_row(row, update, context)
         return
 
-    # DELETE flow (inline)
-    if data == "DELETE|PENDING":
-        # show pending list as buttons
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT trade_id, symbol, side, entry FROM pending_trades ORDER BY id DESC")
-        rows = c.fetchall()
-        conn.close()
-        if not rows:
-            await query.edit_message_text("No pending trades to delete.")
-            return
-        buttons = [[InlineKeyboardButton(f"{sym} {side} @{entry}", callback_data=f"DEL_PENDING|{tid}")] for tid, sym, side, entry in rows]
-        await query.edit_message_text("Select a pending trade to delete:", reply_markup=InlineKeyboardMarkup(buttons))
-        return
-
-    if data == "DELETE|CLOSED":
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT trade_id, symbol, side, entry, exit FROM closed_trades ORDER BY id DESC LIMIT 50")
-        rows = c.fetchall()
-        conn.close()
-        if not rows:
-            await query.edit_message_text("No closed trades to delete.")
-            return
-        buttons = [[InlineKeyboardButton(f"{sym} {side} Entry:{entry} Exit:{exit_p}", callback_data=f"DEL_CLOSED|{tid}")] for tid, sym, side, entry, exit_p in rows]
-        await query.edit_message_text("Select a closed trade to delete:", reply_markup=InlineKeyboardMarkup(buttons))
-        return
-
-    # actual delete actions
+    # ---- DELETE handlers added ----
     if data.startswith("DEL_PENDING|"):
-        tid = data.split("|",1)[1]
+        tid = data.split("|", 1)[1]
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute("DELETE FROM pending_trades WHERE trade_id=?", (tid,))
@@ -674,7 +506,7 @@ async def callback_query_router(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if data.startswith("DEL_CLOSED|"):
-        tid = data.split("|",1)[1]
+        tid = data.split("|", 1)[1]
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute("DELETE FROM closed_trades WHERE trade_id=?", (tid,))
@@ -682,35 +514,19 @@ async def callback_query_router(update: Update, context: ContextTypes.DEFAULT_TY
         conn.close()
         await query.edit_message_text(f"✅ Closed trade {tid} deleted.")
         return
-
-    # SUMMARY inline selection
-    if data.startswith("SUMMARY|"):
-        which = data.split("|",1)[1].lower()
-        if which == "week":
-            await _compute_and_send_summary(update, context, "week")
-        elif which == "month":
-            await _compute_and_send_summary(update, context, "month")
-        else:
-            await query.edit_message_text("Unknown summary choice.")
-        return
-
-    # STAT inline selection (detailed stats)
-    if data.startswith("STAT|"):
-        which = data.split("|",1)[1].lower()
-        await _compute_and_send_stats_callback(update, context, which)
-        return
+    # ---- end DELETE handlers ----
 
     # unknown callback -> ignore
     return
 
 # -----------------------
-# Text router (central) - unchanged most flows
+# Text router (central)
 # -----------------------
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     mode = context.user_data.get("mode")
 
-    # opening (save pending)
+    # ---------------- opening (save pending) flow
     if mode == "await_entry_open":
         try:
             context.user_data["entry"] = float(text)
@@ -773,16 +589,18 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return
 
-    # closing flows
+    # ---------------- close flow prompts
     if mode == "closing_exit":
         try:
             context.user_data["exit"] = float(text)
         except Exception:
             await update.message.reply_text("Invalid exit price. Try again (numeric).")
             return
+        # default lot is from pending if present, else ask
         if context.user_data.get("lot_pending") is not None:
             context.user_data["lot"] = context.user_data.get("lot_pending")
             context.user_data["mode"] = "closing_open_ts"
+            # show stored open_ts and instruct user to type SAME to keep
             stored = context.user_data.get("open_ts_pending")
             await update.message.reply_text(
                 f"Default lot from pending: {context.user_data['lot']}\n"
@@ -809,10 +627,12 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if mode == "closing_open_ts":
         if text.strip().upper() == "SAME":
+            # take from pending
             open_ts_str = context.user_data.get("open_ts_pending")
             try:
                 open_ts = datetime.fromisoformat(open_ts_str)
             except Exception:
+                # fallback to now
                 open_ts = datetime.now(TIMEZONE)
         else:
             parsed = parse_datetime(text)
@@ -844,7 +664,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if mode == "closing_result":
         context.user_data["result"] = text.strip().upper()
         context.user_data["mode"] = "closing_pnl"
-        await update.message.reply_text("Enter PnL (number, e.g. 123.45 or -50 or 1.2%):")
+        await update.message.reply_text("Enter PnL (number, e.g. 123.45 or -50):")
         return
 
     if mode == "closing_pnl":
@@ -854,64 +674,22 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Send 1-10 screenshots (photos). When finished type DONE or send DONE as caption on last photo.")
         return
 
-    # finalize closing when DONE
+    # DONE typed as plain text while in closing_photos
     if text.strip().upper() == "DONE" and context.user_data.get("mode") == "closing_photos":
+        # finalize close
         await finalize_closing(update, context)
-        return
-
-    # interactive risk flow
-    if mode == "risk_ask_balance":
-        try:
-            context.user_data["risk_balance"] = float(text)
-        except Exception:
-            await update.message.reply_text("Invalid balance. Enter numeric account balance:")
-            return
-        context.user_data["mode"] = "risk_ask_pct"
-        await update.message.reply_text("Enter risk percent (e.g. 1 for 1%):")
-        return
-
-    if mode == "risk_ask_pct":
-        try:
-            context.user_data["risk_pct"] = float(text)
-        except Exception:
-            await update.message.reply_text("Invalid percent. Enter number like 1 or 0.5:")
-            return
-        context.user_data["mode"] = "risk_ask_sl"
-        await update.message.reply_text("Enter stop-loss in pips (e.g. 30):")
-        return
-
-    if mode == "risk_ask_sl":
-        try:
-            context.user_data["risk_sl"] = float(text)
-        except Exception:
-            await update.message.reply_text("Invalid pips. Enter numeric stop-loss in pips:")
-            return
-        context.user_data["mode"] = "risk_ask_pair"
-        await update.message.reply_text("Enter pair (optional, e.g. EURUSD) or type SKIP:")
-        return
-
-    if mode == "risk_ask_pair":
-        pair = None
-        if text.strip().upper() not in ("SKIP","NONE"):
-            pair = text.strip().upper()
-        lot, risk_amount, note = compute_lot_size(
-            context.user_data.get("risk_balance"),
-            context.user_data.get("risk_pct"),
-            context.user_data.get("risk_sl"),
-            pair
-        )
-        await update.message.reply_text(f"Risk Amount: {risk_amount:.2f}\nSuggested Lot: {lot:.4f}\n{note}")
-        context.user_data.clear()
         return
 
     # simple interactive flows started by menu
     if mode == "checking_pair":
+        # user typed symbol after pressing menu -> start
         context.user_data["symbol"] = text.upper()
         context.user_data["mode"] = "await_direction_for_check"
         await update.message.reply_text(f"Pair set to {context.user_data['symbol']}. Choose direction:", reply_markup=dir_kb("CHECK|"))
         return
 
     if mode == "closing_pair":
+        # user typed symbol after pressing menu -> attempt to find pending
         symbol = text.upper()
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -926,10 +704,10 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # fallback
-    await update.message.reply_text("I didn't understand that. Use /start SYMBOL, /pending, /close, /closed, /summary, /stat, /risk or /calendar")
+    await update.message.reply_text("I didn't understand that. Use /start SYMBOL, /pending, /close, /closed, or /summary")
 
 # -----------------------
-# Photo handler (closing photos)
+# Photo handler (closing photos) - handles DONE as caption
 # -----------------------
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = context.user_data.get("mode")
@@ -939,6 +717,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         photos = context.user_data.setdefault("photos", [])
         photos.append(fid)
         await update.message.reply_text(f"📸 Screenshot saved ({len(photos)}). Send more or type DONE.")
+        # If caption equals DONE -> finalize
         if caption.upper() == "DONE":
             await finalize_closing(update, context)
     else:
@@ -949,15 +728,20 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -----------------------
 async def finalize_closing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d = context.user_data
+    # ensure required fields
     required = ["trade_id_pending", "symbol", "side", "exit", "lot", "open_ts", "close_ts", "reason", "result", "pnl"]
     for r in required:
         if d.get(r) is None:
+            # fallback: try to pull from pending row for missing fields
             pending = d.get("pending_row")
             if pending:
+                # fill from pending row columns where applicable
+                # pending structure documented earlier
                 if r == "lot" and d.get("lot_pending") is not None:
                     d["lot"] = d.get("lot_pending")
                 if r == "open_ts":
                     d["open_ts"] = d.get("open_ts_pending")
+    # parse datetimes
     try:
         open_ts = datetime.fromisoformat(d["open_ts"])
     except Exception:
@@ -967,6 +751,7 @@ async def finalize_closing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         close_ts = datetime.now(TIMEZONE)
     duration = pretty_duration(open_ts, close_ts)
+    # score breakdown
     try:
         bd = ast.literal_eval(d.get("score_breakdown_pending", "{}")) if d.get("score_breakdown_pending") else {}
     except Exception:
@@ -985,8 +770,10 @@ async def finalize_closing(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💰 PnL: {d.get('pnl')}"
     )
     photos = d.get("photos", []) or []
+    # Save closed trade into DB and delete pending
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    # Use the pending row if present
     pending_row = d.get("pending_row")
     if pending_row:
         db_trade_id = pending_row[3]
@@ -1002,6 +789,7 @@ async def finalize_closing(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_score = pending_row[11]
         db_score_bd = pending_row[12]
     else:
+        # fallback
         db_trade_id = d.get("trade_id_pending") or generate_trade_id(d.get("symbol","UNK"))
         db_user_id = update.effective_user.id
         db_username = update.effective_user.username or ""
@@ -1021,6 +809,7 @@ async def finalize_closing(update: Update, context: ContextTypes.DEFAULT_TYPE):
             (db_trade_id, db_user_id, db_username, db_symbol, db_side, db_entry, float(d.get("exit")),
              db_sl, db_tp, db_lot, db_open_ts, d.get("close_ts"), duration, db_score, str(db_score_bd),
              d.get("reason"), d.get("result"), d.get("pnl"), ",".join(photos)))
+        # delete pending
         c.execute("DELETE FROM pending_trades WHERE trade_id=?", (db_trade_id,))
         conn.commit()
     except Exception as e:
@@ -1030,6 +819,7 @@ async def finalize_closing(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Failed to save closed trade to DB.")
         return
     conn.close()
+    # Post to channel
     app = context.application
     try:
         if photos:
@@ -1051,217 +841,6 @@ async def finalize_closing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
 
 # -----------------------
-# Stats computation (detailed) - used by /stat
-# -----------------------
-def _filter_closed_rows_period(rows, period):
-    """rows: list of tuples from DB (trade fields), period: 'week' or 'month'"""
-    now = datetime.now(TIMEZONE)
-    out = []
-    for r in rows:
-        try:
-            close_ts = datetime.fromisoformat(r[11])  # close_ts index in closed_trades select below
-        except Exception:
-            # try alternative index if different shape - but our SELECT below will match
-            try:
-                close_ts = datetime.fromisoformat(r[3])
-            except Exception:
-                continue
-        if period == "week" and close_ts.isocalendar()[1] != now.isocalendar()[1]:
-            continue
-        if period == "month" and (close_ts.year != now.year or close_ts.month != now.month):
-            continue
-        out.append((r, close_ts))
-    return out
-
-async def _compute_and_send_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, which: str):
-    """
-    Callback entrypoint when user presses STAT|WEEK or STAT|MONTH
-    """
-    if which not in ("week","month"):
-        await update.callback_query.edit_message_text("Unknown stats period.")
-        return
-    await _compute_and_send_stats(update, context, which, edit_message=True)
-
-async def _compute_and_send_stats(update_or_msg, context: ContextTypes.DEFAULT_TYPE, period: str, edit_message=False):
-    """
-    period = 'week' or 'month'
-    edit_message: if True, will edit callback message; else reply to chat
-    """
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    # fetch fields required for stats:
-    # id 0, trade_id 1, user_id 2, username 3, symbol 4, side 5, entry 6, exit 7, sl 8, tp 9, lot 10, open_ts 11, close_ts 12, duration 13, score 14, score_breakdown 15, reason 16, result 17, pnl 18, photos 19
-    c.execute("""SELECT id, trade_id, user_id, username, symbol, side, entry, exit, sl, tp, lot, open_ts, close_ts, duration, score, score_breakdown, reason, result, pnl, photos
-                 FROM closed_trades ORDER BY id DESC""")
-    rows = c.fetchall()
-    conn.close()
-    if not rows:
-        target_msg = update_or_msg if not edit_message else update_or_msg.callback_query
-        if edit_message:
-            await target_msg.edit_message_text("No closed trades yet.")
-        else:
-            await target_msg.reply_text("No closed trades yet.")
-        return
-
-    # filter by period
-    filtered = []
-    now = datetime.now(TIMEZONE)
-    for r in rows:
-        try:
-            close_ts = datetime.fromisoformat(r[12])
-        except Exception:
-            continue
-        if period == "week" and close_ts.isocalendar()[1] != now.isocalendar()[1]:
-            continue
-        if period == "month" and (close_ts.year != now.year or close_ts.month != now.month):
-            continue
-        filtered.append((r, close_ts))
-    if not filtered:
-        target_msg = update_or_msg if not edit_message else update_or_msg.callback_query
-        if edit_message:
-            await target_msg.edit_message_text(f"No closed trades for this {period}.")
-        else:
-            await target_msg.reply_text(f"No closed trades for this {period}.")
-        return
-
-    total = len(filtered)
-    wins = sum(1 for r,ts in filtered if str(r[17]).strip().lower() == "win")
-    losses = sum(1 for r,ts in filtered if str(r[17]).strip().lower() == "loss")
-    bes = sum(1 for r,ts in filtered if str(r[17]).strip().lower() in ("be","b/e","breakeven"))
-    buys = sum(1 for r,ts in filtered if str(r[5]).strip().upper() == "BUY")
-    sells = sum(1 for r,ts in filtered if str(r[5]).strip().upper() == "SELL")
-
-    # compute PnL sums — prefer percent if majority are percent
-    percent_values = []
-    absolute_values = []
-    for r,ts in filtered:
-        pnl_raw = r[18]
-        val, is_pct = parse_pnl_value(pnl_raw)
-        if val is None:
-            continue
-        if is_pct:
-            percent_values.append(val)
-        else:
-            absolute_values.append(val)
-
-    # Overall profit in percent if percent_values exist
-    overall_percent = None
-    if percent_values:
-        overall_percent = sum(percent_values)
-    elif absolute_values:
-        overall_percent = None  # can't reliably convert absolute to percent without account equity; display absolute
-        overall_absolute = sum(absolute_values)
-    else:
-        overall_percent = 0.0
-        overall_absolute = 0.0
-
-    # Buys and Sells profit %
-    buys_pct = []
-    sells_pct = []
-    buys_abs = []
-    sells_abs = []
-    for r,ts in filtered:
-        pnl_raw = r[18]
-        val, is_pct = parse_pnl_value(pnl_raw)
-        if val is None:
-            continue
-        if str(r[5]).strip().upper() == "BUY":
-            if is_pct:
-                buys_pct.append(val)
-            else:
-                buys_abs.append(val)
-        else:
-            if is_pct:
-                sells_pct.append(val)
-            else:
-                sells_abs.append(val)
-
-    # compute averages or sums
-    def safe_sum(lst): return sum(lst) if lst else 0.0
-    total_profit_pct = safe_sum([v for v in percent_values if v>0])
-    total_loss_pct = safe_sum([v for v in percent_values if v<0])
-    overall_buys_profit_pct = safe_sum(buys_pct)
-    overall_sells_profit_pct = safe_sum(sells_pct)
-
-    win_rate = (wins/total*100) if total else 0.0
-    loss_rate = (losses/total*100) if total else 0.0
-
-    # Format header date strings
-    if period == "month":
-        header = datetime.now(TIMEZONE).strftime("%B %Y").upper()
-    else:
-        # week: show Monday-Sunday range
-        now_dt = datetime.now(TIMEZONE)
-        monday = now_dt - timedelta(days=now_dt.weekday())
-        sunday = monday + timedelta(days=6)
-        header = f"{monday.strftime('%d %b')} - {sunday.strftime('%d %b')} {now_dt.year}"
-
-    # Build message
-    lines = []
-    if period == "month":
-        lines.append(f"📊 MONTHLY STATS 📊📈\n({header}) 💎\n")
-    else:
-        lines.append(f"📊 WEEKLY STATS 📊📈\n({header}) 💎\n")
-
-    lines.append(f"Total Trades: {total}")
-    lines.append(f"Total Wins: {wins}")
-    lines.append(f"Total BE: {bes}")
-    lines.append(f"Total Losses: {losses}")
-    lines.append(f"No of Buys: {buys}")
-    lines.append(f"No of Sells: {sells}")
-
-    # show percent sums if we have percent data, else show absolute sums if available
-    if percent_values:
-        lines.append(f"Total Profit (% positive): {total_profit_pct:.2f}%")
-        lines.append(f"Total Loss (% negative): {total_loss_pct:.2f}%")
-        lines.append(f"WIN Rate: {win_rate:.2f}%")
-        lines.append(f"LOSS Rate: {loss_rate:.2f}%")
-        lines.append(f"Overall Buys Profit: {overall_buys_profit_pct:.2f}%")
-        lines.append(f"Overall Sell Profits: {overall_sells_profit_pct:.2f}%")
-        lines.append(f"OVERALL {period.upper()} PROFIT :- [{overall_percent:.2f}%] 📈")
-    else:
-        # fallback to absolute values
-        overall_abs = sum(absolute_values) if absolute_values else 0.0
-        buys_abs_sum = sum(buys_abs) if buys_abs else 0.0
-        sells_abs_sum = sum(sells_abs) if sells_abs else 0.0
-        lines.append(f"Total Profit (abs): {overall_abs:.2f}")
-        lines.append(f"WIN Rate: {win_rate:.2f}%")
-        lines.append(f"LOSS Rate: {loss_rate:.2f}%")
-        lines.append(f"Overall Buys Profit (abs): {buys_abs_sum:.2f}")
-        lines.append(f"Overall Sell Profits (abs): {sells_abs_sum:.2f}")
-        lines.append(f"OVERALL {period.upper()} PROFIT :- [{overall_abs:.2f}] 📈")
-
-    lines.append("\n#setandforget\n#Fx_world\n\n📊🏅💰")
-    msg = "\n".join(lines)
-
-    target_msg = update_or_msg if not edit_message else update_or_msg.callback_query
-    if edit_message:
-        await update_or_msg.callback_query.edit_message_text(msg)
-    else:
-        await update_or_msg.reply_text(msg)
-
-# -----------------------
-# Internal helpers for closing flow (existing)
-# -----------------------
-async def _start_close_from_row(row, update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    context.user_data["pending_row"] = row
-    context.user_data["trade_id_pending"] = row[3]
-    context.user_data["symbol"] = row[4]
-    context.user_data["side"] = row[5]
-    context.user_data["entry_pending"] = row[6]
-    context.user_data["sl_pending"] = row[7]
-    context.user_data["tp_pending"] = row[8]
-    context.user_data["lot_pending"] = row[9]
-    context.user_data["open_ts_pending"] = row[10]
-    context.user_data["score_pending"] = row[11]
-    context.user_data["score_breakdown_pending"] = row[12]
-    context.user_data["mode"] = "closing_exit"
-    await (update.callback_query.message.reply_text if update.callback_query else update.message.reply_text)(
-        f"Closing trade {context.user_data['symbol']} {context.user_data['side']} (Entry: {context.user_data['entry_pending']}).\nEnter EXIT price:"
-    )
-
-# -----------------------
 # Main
 # -----------------------
 def main():
@@ -1273,15 +852,13 @@ def main():
     app.add_handler(CommandHandler("closed", closed_cmd))
     app.add_handler(CommandHandler("close", close_cmd))
     app.add_handler(CommandHandler("summary", summary_cmd))
-    app.add_handler(CommandHandler("delete", delete_cmd))
-    app.add_handler(CommandHandler("stat", stat_cmd))
-    app.add_handler(CommandHandler("risk", risk_cmd))
-    app.add_handler(CommandHandler("calendar", calendar_cmd))
+    app.add_handler(CommandHandler("delete", delete_cmd))  # <-- new delete command
 
     # Callbacks
     app.add_handler(CallbackQueryHandler(callback_query_router))
 
-    # Message handlers
+    # Messages
+    # Photo handler must be added before text handler so photos are processed properly
     app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, photo_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
